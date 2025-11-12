@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
 	"io"
 	"log"
 	"net"
@@ -105,15 +104,15 @@ func main() {
 
 	go node.connectToPeers()
 
-	for {
-		msg := &pb.Message{
-			From:             node.id,
-			Message:          fmt.Sprintf("Hello from %s!", node.id),
-			LamportTimestamp: time.Now().Unix(),
-		}
-		node.broadcast(msg)
+	// wait a bit for connections to be esstablishd
+	time.Sleep(5 * time.Second)
 
-		time.Sleep(5 * time.Second)
+	// we, periodically, request the importnt section
+	for {
+		node.requestCS()
+		// todo : probably have to enter cs, do the work, then release the cs
+
+		time.Sleep(10 * time.Second)
 	}
 }
 
@@ -191,7 +190,7 @@ func (n *Node) connectToPeers() {
 			log.Printf("[%s] connected to peer %s", n.id, peer)
 		}
 
-		// Sleep a bit to avoid busy-looping
+		// sleep for a bit to avoid busy loop
 		time.Sleep(3 * time.Second)
 	}
 }
@@ -260,6 +259,42 @@ func (n *Node) broadcast(msg *pb.Message) {
 
 	for _, peer := range peers {
 		go n.SendMessage(peer, msg)
+	}
+}
+
+// request access to important section
+func (n *Node) requestCS() {
+	n.mu.Lock()
+	n.state = WANTED
+	n.lamport++
+	reqTimestamp := n.lamport
+	n.replies = 0
+	// now we add add our own request to queue
+	n.addToQueue(reqTimestamp, n.id)
+	n.mu.Unlock()
+
+	log.Printf("[%s] Requesting CS (ts=%d)", n.id, reqTimestamp)
+
+	// sending of request to all peers
+	req := &pb.Message{
+		MessageType:      pb.MessageType_REQUEST,
+		From:             n.id,
+		LamportTimestamp: reqTimestamp,
+		Message:          "request",
+	}
+	n.broadcast(req)
+
+	// then waiting for replies from all peers
+	for {
+		n.mu.Lock()
+		gotAllReplies := n.replies >= n.numPeers
+		n.mu.Unlock()
+
+		if gotAllReplies {
+			log.Printf("[%s] Got all replies, can enter CS", n.id)
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
