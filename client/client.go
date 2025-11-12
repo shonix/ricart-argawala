@@ -8,12 +8,26 @@ import (
 	"log"
 	"net"
 	pb "ricart-argawala/grpc"
+	"sort"
 	"sync"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
+
+// node states for the algorithm
+const (
+	RELEASED = iota // not interested in CS
+	WANTED          // wants to enter CS
+	HELD            // currently in CS
+)
+
+// Request for the critical section
+type Request struct {
+	ts     int64
+	nodeId string
+}
 
 type Node struct {
 	pb.UnimplementedNodeServer
@@ -23,6 +37,13 @@ type Node struct {
 	connections map[string]pb.Node_MessageStreamClient
 	mu          sync.Mutex
 	lamport     int64
+
+	// algorithm state
+	state        int       // RELEASED, WANTED, or HELD
+	reqQueue     []Request // pending requests sorted by timestamp
+	deferredList []string  // nodes we need to reply to later
+	replies      int       // how many replies we got
+	numPeers     int       // total peers
 }
 
 func (n *Node) MessageStream(stream pb.Node_MessageStreamServer) error {
@@ -63,11 +84,19 @@ func main() {
 	addr := flag.String("addr", "localhost:50051", "server address")
 	flag.Parse()
 
+	peers := []string{":50052", ":50053", ":50054"}
 	node := &Node{
 		id:          *id,
 		addr:        *addr,
-		peers:       []string{":50052", ":50053", ":50054"},
+		peers:       peers,
 		connections: make(map[string]pb.Node_MessageStreamClient),
+
+		// init algorithm state
+		state:        RELEASED,
+		reqQueue:     make([]Request, 0),
+		deferredList: make([]string, 0),
+		replies:      0,
+		numPeers:     len(peers),
 	}
 
 	go node.startServer()
@@ -231,5 +260,30 @@ func (n *Node) broadcast(msg *pb.Message) {
 
 	for _, peer := range peers {
 		go n.SendMessage(peer, msg)
+	}
+}
+
+// add request to queue and sort it
+func (n *Node) addToQueue(ts int64, id string) {
+	n.reqQueue = append(n.reqQueue, Request{
+		ts:     ts,
+		nodeId: id,
+	})
+	// sort by timestamp, then node id
+	sort.Slice(n.reqQueue, func(i, j int) bool {
+		if n.reqQueue[i].ts == n.reqQueue[j].ts {
+			return n.reqQueue[i].nodeId < n.reqQueue[j].nodeId
+		}
+		return n.reqQueue[i].ts < n.reqQueue[j].ts
+	})
+}
+
+// remove request from queue
+func (n *Node) removeFromQueue(id string) {
+	for i, req := range n.reqQueue {
+		if req.nodeId == id {
+			n.reqQueue = append(n.reqQueue[:i], n.reqQueue[i+1:]...)
+			return
+		}
 	}
 }
