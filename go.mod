@@ -1,6 +1,6 @@
 module ricart-argawala
 
-go 1.25.0
+go 1.25
 
 require (
 	google.golang.org/grpc v1.76.0

@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	pb "ricart-argawala/grpc"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,6 +23,8 @@ const (
 	WANTED          // wants to enter CS
 	HELD            // currently in CS
 )
+
+const replyPrefix = "reply:"
 
 // Request for the critical section
 type Request struct {
@@ -124,6 +128,15 @@ func (n *Node) onRequest(msg *pb.Message) {
 
 // got a reply from another node
 func (n *Node) onReply(msg *pb.Message) {
+	if !strings.HasPrefix(msg.Message, replyPrefix) {
+		log.Printf("[%s] ignoring reply with unexpected format from %s: %s", n.id, msg.From, msg.Message)
+		return
+	}
+	target := strings.TrimPrefix(msg.Message, replyPrefix)
+	if target != n.id {
+		return
+	}
+
 	log.Printf("[%s] got reply from %s", n.id, msg.From)
 
 	n.mu.Lock()
@@ -149,7 +162,7 @@ func (n *Node) sendReply(toNode string) {
 		MessageType:      pb.MessageType_REPLY,
 		From:             n.id,
 		LamportTimestamp: n.lamport,
-		Message:          "reply to " + toNode,
+		Message:          replyPrefix + toNode,
 	}
 
 	// just broadcast it - all peers get it but only requester uses it
@@ -163,6 +176,16 @@ func main() {
 	flag.Parse()
 
 	peers := []string{":50052", ":50053", ":50054"}
+	numPeers := 0
+	for _, peer := range peers {
+		if peer == *addr {
+			continue
+		}
+		numPeers++
+	}
+	if numPeers == 0 {
+		numPeers = len(peers)
+	}
 	node := &Node{
 		id:          *id,
 		addr:        *addr,
@@ -174,7 +197,7 @@ func main() {
 		reqQueue:     make([]Request, 0),
 		deferredList: make([]string, 0),
 		replies:      0,
-		numPeers:     len(peers),
+		numPeers:     numPeers,
 	}
 
 	go node.startServer()
@@ -250,41 +273,50 @@ func (n *Node) startServer() {
 func (n *Node) connectToPeers() {
 	for {
 		for _, peer := range n.peers {
-			n.mu.Lock()
-			_, connected := n.connections[peer]
-			n.mu.Unlock()
-			if connected {
+			if peer == n.addr {
 				continue
 			}
-
-			// Attempt to dial the peer
-			conn, err := grpc.NewClient(peer, grpc.WithTransportCredentials(insecure.NewCredentials()))
-			if err != nil {
+			if _, err := n.ensureStream(peer); err != nil {
 				log.Printf("[%s] failed to dial %s: %v", n.id, peer, err)
-				continue
 			}
-
-			client := pb.NewNodeClient(conn)
-
-			// Persistent context for the stream (do NOT cancel)
-			stream, err := client.MessageStream(context.Background())
-			if err != nil {
-				log.Printf("[%s] failed to open stream to %s: %v", n.id, peer, err)
-				_ = conn.Close()
-				continue
-			}
-
-			n.mu.Lock()
-			n.connections[peer] = stream
-			n.mu.Unlock()
-
-			go n.listenForAcks(peer, stream)
-			log.Printf("[%s] connected to peer %s", n.id, peer)
 		}
 
 		// sleep for a bit to avoid busy loop
 		time.Sleep(3 * time.Second)
 	}
+}
+
+func (n *Node) ensureStream(peer string) (pb.Node_MessageStreamClient, error) {
+	n.mu.Lock()
+	stream, ok := n.connections[peer]
+	n.mu.Unlock()
+	if ok {
+		return stream, nil
+	}
+
+	// Attempt to dial the peer
+	conn, err := grpc.NewClient(peer, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, fmt.Errorf("dial %s: %w", peer, err)
+	}
+
+	client := pb.NewNodeClient(conn)
+
+	// Persistent context for the stream (do NOT cancel)
+	stream, err = client.MessageStream(context.Background())
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("open stream to %s: %w", peer, err)
+	}
+
+	n.mu.Lock()
+	n.connections[peer] = stream
+	n.mu.Unlock()
+
+	go n.listenForAcks(peer, stream)
+	log.Printf("[%s] connected to peer %s", n.id, peer)
+
+	return stream, nil
 }
 
 //func (n *Node) listenForAcks(peer string, stream pb.Node_MessageStreamClient, cc *grpc.ClientConn) {
@@ -313,6 +345,11 @@ func (n *Node) listenForAcks(peer string, stream pb.Node_MessageStreamClient) {
 		ack, err := stream.Recv()
 		if err != nil {
 			log.Printf("[%s] ack recv from %s failed: %v", n.id, peer, err)
+			n.mu.Lock()
+			if current, ok := n.connections[peer]; ok && current == stream {
+				delete(n.connections, peer)
+			}
+			n.mu.Unlock()
 			return
 		}
 
@@ -321,6 +358,15 @@ func (n *Node) listenForAcks(peer string, stream pb.Node_MessageStreamClient) {
 }
 
 func (n *Node) SendMessage(peer string, msg *pb.Message) {
+	if peer == n.addr {
+		return
+	}
+	stream, err := n.ensureStream(peer)
+	if err != nil {
+		log.Printf("[%s] cannot send to %s: %v", n.id, peer, err)
+		return
+	}
+
 	n.mu.Lock()
 	// Increment Lamport on send
 	n.lamport++
@@ -336,21 +382,24 @@ func (n *Node) SendMessage(peer string, msg *pb.Message) {
 
 	if err := stream.Send(msg); err != nil {
 		log.Printf("[%s] Error sending message to %s: %v", n.id, peer, err)
+		n.mu.Lock()
+		if current, ok := n.connections[peer]; ok && current == stream {
+			delete(n.connections, peer)
+		}
+		n.mu.Unlock()
 	} else {
 		log.Printf("[%s] Sent message to %s: %s (Lamport: %d)", n.id, peer, msg.Message, msg.LamportTimestamp)
 	}
 }
 
 func (n *Node) broadcast(msg *pb.Message) {
-	n.mu.Lock()
-	peers := make([]string, 0, len(n.connections))
-	for peer := range n.connections {
-		peers = append(peers, peer)
-	}
-	n.mu.Unlock()
-
-	for _, peer := range peers {
-		go n.SendMessage(peer, msg)
+	for _, peer := range n.peers {
+		if peer == n.addr {
+			continue
+		}
+		peer := peer // ensure each goroutine captures its own peer
+		msgCopy := *msg
+		go n.SendMessage(peer, &msgCopy)
 	}
 }
 
@@ -408,29 +457,28 @@ func (n *Node) enterCS() {
 // release CS
 func (n *Node) releaseCS() {
 	n.mu.Lock()
-	defer n.mu.Unlock()
 
 	n.state = RELEASED
-
-	// remove ourselves from queue
 	n.removeFromQueue(n.id)
 
-	// send replies we deferred
-	if len(n.deferredList) > 0 {
-		log.Printf("[%s] sending %d deferred replies", n.id, len(n.deferredList))
-	}
-	for _, nodeId := range n.deferredList {
-		n.sendReply(nodeId)
-	}
-	n.deferredList = make([]string, 0)
+	deferred := append([]string(nil), n.deferredList...)
+	n.deferredList = nil
 
-	// tell everyone we're done
 	release := &pb.Message{
 		MessageType:      pb.MessageType_RELEASE,
 		From:             n.id,
 		LamportTimestamp: n.lamport,
 		Message:          "release",
 	}
+	n.mu.Unlock()
+
+	if len(deferred) > 0 {
+		log.Printf("[%s] sending %d deferred replies", n.id, len(deferred))
+	}
+	for _, nodeId := range deferred {
+		n.sendReply(nodeId)
+	}
+
 	n.broadcast(release)
 
 	log.Printf("[%s] released CS", n.id)
