@@ -91,8 +91,6 @@ func (n *Node) onRequest(msg *pb.Message) {
 	log.Printf("[%s] Received REQUEST from %s (ts=%d)", n.id, msg.From, msg.LamportTimestamp)
 
 	n.mu.Lock()
-	defer n.mu.Unlock()
-
 	// add to queue
 	n.addToQueue(msg.LamportTimestamp, msg.From)
 
@@ -115,10 +113,12 @@ func (n *Node) onRequest(msg *pb.Message) {
 
 	if replyNow {
 		log.Printf("[%s] Sending REPLY to %s", n.id, msg.From)
+		n.mu.Unlock() // Release lock before calling sendReply to avoid deadlock
 		n.sendReply(msg.From)
 	} else {
 		log.Printf("[%s] Deferring reply to %s", n.id, msg.From)
 		n.deferredList = append(n.deferredList, msg.From)
+		n.mu.Unlock()
 	}
 }
 
@@ -183,8 +183,19 @@ func main() {
 
 	go node.connectToPeers()
 
-	// give it some time to connect
-	time.Sleep(5 * time.Second)
+	// wait until we have all connections
+	log.Printf("[%s] waiting for all %d peers to connect...", node.id, node.numPeers)
+	for {
+		node.mu.Lock()
+		connected := len(node.connections)
+		node.mu.Unlock()
+
+		if connected >= node.numPeers {
+			log.Printf("[%s] now all the peers are connected -- starting algorithm", node.id)
+			break
+		}
+		time.Sleep(1 * time.Second)
+	}
 
 	// keep requesting CS periodically
 	for {
@@ -247,7 +258,7 @@ func (n *Node) connectToPeers() {
 			}
 
 			// Attempt to dial the peer
-			conn, err := grpc.Dial(peer, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			conn, err := grpc.NewClient(peer, grpc.WithTransportCredentials(insecure.NewCredentials()))
 			if err != nil {
 				log.Printf("[%s] failed to dial %s: %v", n.id, peer, err)
 				continue
