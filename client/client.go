@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
 	"io"
 	"log"
 	"net"
@@ -15,14 +14,71 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
+type State int
+
+const (
+	RELEASED State = iota
+	WANTED
+	HELD
+)
+
 type Node struct {
 	pb.UnimplementedNodeServer
-	id          string
-	addr        string
-	peers       []string
-	connections map[string]pb.Node_MessageStreamClient
-	mu          sync.Mutex
-	lamport     int64
+	id               string
+	addr             string
+	peers            []string
+	connections      map[string]pb.Node_MessageStreamClient
+	mu               sync.Mutex
+	lamport          int64
+	state            State
+	replyCount       int
+	requestTimeStamp int64
+	requestQueue     []pb.Message
+	expectedReplies  int
+}
+
+func (n *Node) requestCriticalSection() {
+	n.mu.Lock()
+	n.state = WANTED
+	n.lamport++
+	n.requestTimeStamp = n.lamport
+	n.replyCount = 0
+	n.expectedReplies = len(n.connections)
+	req := &pb.Message{
+		From:             n.addr,
+		Message:          "REQUEST",
+		LamportTimestamp: n.lamport,
+	}
+	n.mu.Unlock()
+
+	log.Printf("[%s] Sending req for CS (T=%d)", n.id, n.requestTimeStamp)
+	n.broadcast(req)
+}
+
+func (n *Node) releaseCriticalSection() {
+	n.mu.Lock()
+	n.state = RELEASED
+	n.replyCount = 0
+	n.requestTimeStamp = 0
+	queued := n.requestQueue
+	n.requestQueue = nil
+	n.mu.Unlock()
+
+	log.Printf("[%s] Release CS, replying to %d queued requests", n.id, len(queued))
+
+	for _, m := range queued {
+		n.mu.Lock()
+		n.lamport++
+		ts := n.lamport
+		n.mu.Unlock()
+
+		reply := &pb.Message{
+			From:             n.addr,
+			Message:          "REPLY",
+			LamportTimestamp: ts,
+		}
+		n.SendMessage(m.From, reply)
+	}
 }
 
 func (n *Node) MessageStream(stream pb.Node_MessageStreamServer) error {
@@ -38,21 +94,21 @@ func (n *Node) MessageStream(stream pb.Node_MessageStreamServer) error {
 
 		// Update Lamport clock: max(current, received) + 1
 		n.mu.Lock()
-		if msg.LamportTimestamp > n.lamport {
-			n.lamport = msg.LamportTimestamp
-		}
-		n.lamport++
+		n.lamport = max(n.lamport, msg.LamportTimestamp) + 1
+		localTimeStamp := n.lamport
 		n.mu.Unlock()
 
-		log.Printf("[%s] Received from %s: %s (Lamport: %d)", n.id, msg.From, msg.Message, msg.LamportTimestamp)
-
-		// Send acknowledgment
-		ack := &pb.Ack{
-			From:   n.id,
-			Status: "received",
+		switch msg.Message {
+		case "REQUEST":
+			n.handleRequest(msg)
+		case "REPLY":
+			n.handleReply(msg)
 		}
-		if err := stream.Send(ack); err != nil {
-			log.Printf("[%s] Error sending ack: %v", n.id, err)
+
+		log.Printf("[%s <- %s] %s (local=%d, msg=%d)", n.id, msg.From, msg.Message, localTimeStamp, msg.LamportTimestamp)
+
+		if err := stream.Send(&pb.Ack{From: n.addr, Status: "received"}); err != nil {
+			log.Printf("[%s] ack send err: %v", n.id, err)
 			return err
 		}
 	}
@@ -63,10 +119,18 @@ func main() {
 	addr := flag.String("addr", "localhost:50051", "server address")
 	flag.Parse()
 
+	actualPeers := make([]string, 0)
+	allPossiblePeers := []string{"localhost:50052", "localhost:50053", "localhost:50054"}
+
+	for _, p := range allPossiblePeers {
+		if p != *addr {
+			actualPeers = append(actualPeers, p)
+		}
+	}
 	node := &Node{
 		id:          *id,
 		addr:        *addr,
-		peers:       []string{":50052", ":50053", ":50054"},
+		peers:       actualPeers,
 		connections: make(map[string]pb.Node_MessageStreamClient),
 	}
 
@@ -77,14 +141,22 @@ func main() {
 	go node.connectToPeers()
 
 	for {
-		msg := &pb.Message{
-			From:             node.id,
-			Message:          fmt.Sprintf("Hello from %s!", node.id),
-			LamportTimestamp: time.Now().Unix(),
-		}
-		node.broadcast(msg)
+		node.mu.Lock()
+		connectedCount := len(node.connections)
+		requiredCount := len(node.peers)
+		node.mu.Unlock()
 
-		time.Sleep(5 * time.Second)
+		if connectedCount == requiredCount {
+			log.Printf("[%s] All %d peers connected. Starting CS loop.", node.id, requiredCount)
+			break
+		}
+		log.Printf("[%s] Waiting for connections (%d/%d)...", node.id, connectedCount, requiredCount)
+		time.Sleep(1 * time.Second)
+	}
+
+	for {
+		node.requestCriticalSection()
+		time.Sleep(10 * time.Second)
 	}
 }
 
@@ -102,30 +174,6 @@ func (n *Node) startServer() {
 		log.Fatalf("failed to serve: %v", err)
 	}
 }
-
-//	func (n *Node) connectToPeers() {
-//		for _, peer := range n.peers {
-//			conn, err := grpc.NewClient(peer, grpc.WithTransportCredentials(insecure.NewCredentials()))
-//			if err != nil {
-//				log.Printf("Error connecting to peer: %v", err)
-//				continue
-//			}
-//
-//			client := pb.NewNodeClient(conn)
-//			stream, err := client.MessageStream(context.Background())
-//			if err != nil {
-//				log.Printf("Error connecting to peer: %v", err)
-//				continue
-//			}
-//
-//			n.mu.Lock()
-//			n.connections[peer] = stream
-//			n.mu.Unlock()
-//
-//			go n.listenForAcks(peer, stream)
-//			log.Printf("Connected to peer %v", n.id, peer)
-//		}
-//	}
 
 func (n *Node) connectToPeers() {
 	for {
@@ -167,31 +215,13 @@ func (n *Node) connectToPeers() {
 	}
 }
 
-//func (n *Node) listenForAcks(peer string, stream pb.Node_MessageStreamClient, cc *grpc.ClientConn) {
-//	for {
-//		ack, err := stream.Recv()
-//		if err != nil {
-//			log.Printf("[%s] ack recv from %s failed: %v", n.id, peer, err)
-//
-//			// remove entry so connectToPeers will retry
-//			n.mu.Lock()
-//			delete(n.connections, peer)
-//			n.mu.Unlock()
-//
-//			// close the underlying client connection
-//			if cc != nil {
-//				_ = cc.Close()
-//			}
-//			return
-//		}
-//		log.Printf("[%s] got ack from %s: %s", n.id, ack.From, ack.Status)
-//	}
-//}
-
 func (n *Node) listenForAcks(peer string, stream pb.Node_MessageStreamClient) {
 	for {
 		ack, err := stream.Recv()
 		if err != nil {
+			n.mu.Lock()
+			delete(n.connections, peer)
+			n.mu.Unlock()
 			log.Printf("[%s] ack recv from %s failed: %v", n.id, peer, err)
 			return
 		}
@@ -202,10 +232,6 @@ func (n *Node) listenForAcks(peer string, stream pb.Node_MessageStreamClient) {
 
 func (n *Node) SendMessage(peer string, msg *pb.Message) {
 	n.mu.Lock()
-	// Increment Lamport on send
-	n.lamport++
-	msg.LamportTimestamp = n.lamport
-
 	stream, ok := n.connections[peer]
 	n.mu.Unlock()
 
@@ -215,9 +241,9 @@ func (n *Node) SendMessage(peer string, msg *pb.Message) {
 	}
 
 	if err := stream.Send(msg); err != nil {
-		log.Printf("[%s] Error sending message to %s: %v", n.id, peer, err)
+		log.Printf("[%s] send to %s failed %v", n.id, peer, err)
 	} else {
-		log.Printf("[%s] Sent message to %s: %s (Lamport: %d)", n.id, peer, msg.Message, msg.LamportTimestamp)
+		log.Printf("[%s -> %s] %s (T=%d)", n.id, peer, msg.Message, msg.LamportTimestamp)
 	}
 }
 
@@ -232,4 +258,62 @@ func (n *Node) broadcast(msg *pb.Message) {
 	for _, peer := range peers {
 		go n.SendMessage(peer, msg)
 	}
+}
+
+func (n *Node) handleRequest(msg *pb.Message) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if n.state == HELD || n.state == WANTED &&
+		(n.requestTimeStamp < msg.LamportTimestamp ||
+			(n.requestTimeStamp == msg.LamportTimestamp &&
+				n.addr < msg.From)) {
+
+		n.requestQueue = append(n.requestQueue, *msg)
+		log.Printf("[%s] deferring request from %s", n.id, msg.From)
+		return
+	}
+
+	n.lamport++
+	reply := &pb.Message{
+		From:             n.addr,
+		Message:          "REPLY",
+		LamportTimestamp: n.lamport,
+	}
+
+	go n.SendMessage(msg.From, reply)
+	log.Printf("[%s] replied to request from %s", n.id, msg.From)
+}
+
+func (n *Node) handleReply(msg *pb.Message) {
+	n.mu.Lock()
+	n.replyCount++
+	ready := n.state == WANTED && n.replyCount == n.expectedReplies
+	n.mu.Unlock()
+
+	if ready {
+		n.mu.Lock()
+		n.state = HELD
+		n.lamport++
+		n.mu.Unlock()
+		log.Printf("[%s] Entering CS", n.addr)
+		go n.criticalSection()
+	}
+}
+
+func (n *Node) criticalSection() {
+	log.Printf("[%s] **IN CRITICAL SECTION** (Lamport=%d)", n.id, n.lamport)
+	time.Sleep(5 * time.Second)
+	n.mu.Lock()
+	n.lamport++
+	n.mu.Unlock()
+	log.Printf("[%s] **EXITING CRITICAL SECTION**", n.id)
+	n.releaseCriticalSection()
+}
+
+func max(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }
