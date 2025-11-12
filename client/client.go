@@ -64,9 +64,17 @@ func (n *Node) MessageStream(stream pb.Node_MessageStreamServer) error {
 		n.lamport++
 		n.mu.Unlock()
 
-		log.Printf("[%s] Received from %s: %s (Lamport: %d)", n.id, msg.From, msg.Message, msg.LamportTimestamp)
+		// check what type of message it is
+		switch msg.MessageType {
+		case pb.MessageType_REQUEST:
+			n.onRequest(msg)
+		case pb.MessageType_REPLY:
+			n.onReply(msg)
+		case pb.MessageType_RELEASE:
+			n.onRelease(msg)
+		}
 
-		// Send acknowledgment
+		// send ack
 		ack := &pb.Ack{
 			From:   n.id,
 			Status: "received",
@@ -76,6 +84,77 @@ func (n *Node) MessageStream(stream pb.Node_MessageStreamServer) error {
 			return err
 		}
 	}
+}
+
+// when we get a request from another node
+func (n *Node) onRequest(msg *pb.Message) {
+	log.Printf("[%s] Received REQUEST from %s (ts=%d)", n.id, msg.From, msg.LamportTimestamp)
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	// add to queue
+	n.addToQueue(msg.LamportTimestamp, msg.From)
+
+	// figure out if we should reply now
+	replyNow := false
+	switch n.state {
+	case RELEASED:
+		replyNow = true
+	case WANTED:
+		// check timestamps to see who has priority
+		if msg.LamportTimestamp > n.lamport {
+			replyNow = false
+		} else if msg.LamportTimestamp < n.lamport {
+			replyNow = true
+		} else {
+			// timestamps are equal, compare node ids
+			replyNow = msg.From > n.id
+		}
+	}
+
+	if replyNow {
+		log.Printf("[%s] Sending REPLY to %s", n.id, msg.From)
+		n.sendReply(msg.From)
+	} else {
+		log.Printf("[%s] Deferring reply to %s", n.id, msg.From)
+		n.deferredList = append(n.deferredList, msg.From)
+	}
+}
+
+// got a reply from another node
+func (n *Node) onReply(msg *pb.Message) {
+	log.Printf("[%s] Received REPLY from %s", n.id, msg.From)
+
+	n.mu.Lock()
+	n.replies++
+	log.Printf("[%s] Reply count: %d/%d", n.id, n.replies, n.numPeers)
+	n.mu.Unlock()
+}
+
+// someone released the CS
+func (n *Node) onRelease(msg *pb.Message) {
+	log.Printf("[%s] Received RELEASE from %s", n.id, msg.From)
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	// take them out of the queue
+	n.removeFromQueue(msg.From)
+}
+
+// send reply back
+func (n *Node) sendReply(toNode string) {
+	reply := &pb.Message{
+		MessageType:      pb.MessageType_REPLY,
+		From:             n.id,
+		LamportTimestamp: n.lamport,
+		Message:          "reply to " + toNode,
+	}
+
+	// just broadcast it - all peers get it but only requester uses it
+	// TODO: could optimize by mapping node IDs to connections
+	n.broadcast(reply)
 }
 
 func main() {
@@ -104,13 +183,13 @@ func main() {
 
 	go node.connectToPeers()
 
-	// wait a bit for connections to be esstablishd
+	// give it some time to connect
 	time.Sleep(5 * time.Second)
 
-	// we, periodically, request the importnt section
+	// keep requesting CS periodically
 	for {
 		node.requestCS()
-		// todo : probably have to enter cs, do the work, then release the cs
+		// TODO: enter CS, do work, release
 
 		time.Sleep(10 * time.Second)
 	}
@@ -262,35 +341,35 @@ func (n *Node) broadcast(msg *pb.Message) {
 	}
 }
 
-// request access to important section
+// try to get access to critical section
 func (n *Node) requestCS() {
 	n.mu.Lock()
 	n.state = WANTED
 	n.lamport++
-	reqTimestamp := n.lamport
+	reqTs := n.lamport
 	n.replies = 0
-	// now we add add our own request to queue
-	n.addToQueue(reqTimestamp, n.id)
+	// put our own request in the queue
+	n.addToQueue(reqTs, n.id)
 	n.mu.Unlock()
 
-	log.Printf("[%s] Requesting CS (ts=%d)", n.id, reqTimestamp)
+	log.Printf("[%s] Requesting CS (ts=%d)", n.id, reqTs)
 
-	// sending of request to all peers
+	// send request to everyone
 	req := &pb.Message{
 		MessageType:      pb.MessageType_REQUEST,
 		From:             n.id,
-		LamportTimestamp: reqTimestamp,
+		LamportTimestamp: reqTs,
 		Message:          "request",
 	}
 	n.broadcast(req)
 
-	// then waiting for replies from all peers
+	// wait until we have all replies
 	for {
 		n.mu.Lock()
-		gotAllReplies := n.replies >= n.numPeers
+		got := n.replies >= n.numPeers
 		n.mu.Unlock()
 
-		if gotAllReplies {
+		if got {
 			log.Printf("[%s] Got all replies, can enter CS", n.id)
 			break
 		}
@@ -298,13 +377,13 @@ func (n *Node) requestCS() {
 	}
 }
 
-// add request to queue and sort it
-func (n *Node) addToQueue(ts int64, id string) {
+// add to queue and keep it sorted
+func (n *Node) addToQueue(timestamp int64, nodeId string) {
 	n.reqQueue = append(n.reqQueue, Request{
-		ts:     ts,
-		nodeId: id,
+		ts:     timestamp,
+		nodeId: nodeId,
 	})
-	// sort by timestamp, then node id
+	// sort by timestamp first, then by node id
 	sort.Slice(n.reqQueue, func(i, j int) bool {
 		if n.reqQueue[i].ts == n.reqQueue[j].ts {
 			return n.reqQueue[i].nodeId < n.reqQueue[j].nodeId
@@ -313,10 +392,10 @@ func (n *Node) addToQueue(ts int64, id string) {
 	})
 }
 
-// remove request from queue
-func (n *Node) removeFromQueue(id string) {
-	for i, req := range n.reqQueue {
-		if req.nodeId == id {
+// remove from queue
+func (n *Node) removeFromQueue(nodeId string) {
+	for i, r := range n.reqQueue {
+		if r.nodeId == nodeId {
 			n.reqQueue = append(n.reqQueue[:i], n.reqQueue[i+1:]...)
 			return
 		}
