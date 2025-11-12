@@ -124,22 +124,22 @@ func (n *Node) onRequest(msg *pb.Message) {
 
 // got a reply from another node
 func (n *Node) onReply(msg *pb.Message) {
-	log.Printf("[%s] Received REPLY from %s", n.id, msg.From)
+	log.Printf("[%s] got reply from %s", n.id, msg.From)
 
 	n.mu.Lock()
 	n.replies++
-	log.Printf("[%s] Reply count: %d/%d", n.id, n.replies, n.numPeers)
+	log.Printf("[%s] replies so far: %d out of %d", n.id, n.replies, n.numPeers)
 	n.mu.Unlock()
 }
 
 // someone released the CS
 func (n *Node) onRelease(msg *pb.Message) {
-	log.Printf("[%s] Received RELEASE from %s", n.id, msg.From)
+	log.Printf("[%s] %s released CS", n.id, msg.From)
 
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	// take them out of the queue
+	// remove from queue
 	n.removeFromQueue(msg.From)
 }
 
@@ -189,8 +189,10 @@ func main() {
 	// keep requesting CS periodically
 	for {
 		node.requestCS()
-		// TODO: enter CS, do work, release
+		node.enterCS()
+		node.releaseCS()
 
+		// wait a bit before next request
 		time.Sleep(10 * time.Second)
 	}
 }
@@ -348,11 +350,11 @@ func (n *Node) requestCS() {
 	n.lamport++
 	reqTs := n.lamport
 	n.replies = 0
-	// put our own request in the queue
+	// put our request in queue too
 	n.addToQueue(reqTs, n.id)
 	n.mu.Unlock()
 
-	log.Printf("[%s] Requesting CS (ts=%d)", n.id, reqTs)
+	log.Printf("[%s] requesting CS with timestamp %d", n.id, reqTs)
 
 	// send request to everyone
 	req := &pb.Message{
@@ -363,18 +365,64 @@ func (n *Node) requestCS() {
 	}
 	n.broadcast(req)
 
-	// wait until we have all replies
+	// wait for replies
 	for {
 		n.mu.Lock()
 		got := n.replies >= n.numPeers
 		n.mu.Unlock()
 
 		if got {
-			log.Printf("[%s] Got all replies, can enter CS", n.id)
+			log.Printf("[%s] got all replies!", n.id)
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+}
+
+// enter CS
+func (n *Node) enterCS() {
+	n.mu.Lock()
+	n.state = HELD
+	n.mu.Unlock()
+
+	log.Printf("[%s] *** entering CS ***", n.id)
+
+	// do work in CS
+	log.Printf("[%s] doing work", n.id)
+	time.Sleep(2 * time.Second)
+
+	log.Printf("[%s] *** done ***", n.id)
+}
+
+// release CS
+func (n *Node) releaseCS() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	n.state = RELEASED
+
+	// remove ourselves from queue
+	n.removeFromQueue(n.id)
+
+	// send replies we deferred
+	if len(n.deferredList) > 0 {
+		log.Printf("[%s] sending %d deferred replies", n.id, len(n.deferredList))
+	}
+	for _, nodeId := range n.deferredList {
+		n.sendReply(nodeId)
+	}
+	n.deferredList = make([]string, 0)
+
+	// tell everyone we're done
+	release := &pb.Message{
+		MessageType:      pb.MessageType_RELEASE,
+		From:             n.id,
+		LamportTimestamp: n.lamport,
+		Message:          "release",
+	}
+	n.broadcast(release)
+
+	log.Printf("[%s] released CS", n.id)
 }
 
 // add to queue and keep it sorted
